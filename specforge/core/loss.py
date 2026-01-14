@@ -17,7 +17,9 @@ def _compute_loss(logits, target_p, position_mask):
     logits = logits.float()
     out_logp = nn.LogSoftmax(dim=2)(logits)
     plogp = target_p * out_logp
-    loss = -torch.sum(position_mask * plogp, 2).mean()
+    # FIX: normalize by valid positions, not all positions (mask dilution bug)
+    valid_count = position_mask.squeeze(-1).sum().clamp_min(1e-6)
+    loss = -torch.sum(position_mask * plogp, 2).sum() / valid_count
     return loss
 
 
@@ -198,13 +200,17 @@ class LogSoftmaxLoss(torch.autograd.Function):
             num_warps=num_warps,
         )
         ctx.save_for_backward(logits.detach(), target, position_mask, m, d)
-        return loss.squeeze(1).mean()
+        # FIX: normalize by valid positions, not all positions (mask dilution bug)
+        valid_count = position_mask.sum().clamp_min(1e-6)
+        return loss.squeeze(1).sum() / valid_count
 
     @staticmethod
     def backward(ctx, grad_output):
         logits, target, position_mask, m, d = ctx.saved_tensors
         B, T, V = logits.shape
-        scaling_factor = 1.0 / (B * T)
+        # FIX: scale by valid positions, not all positions (mask dilution bug)
+        valid_count = position_mask.sum().clamp_min(1e-6).item()
+        scaling_factor = 1.0 / valid_count
         logits = logits.contiguous().view(B * T, V)
         target = target.contiguous().view(B * T, V)
         position_mask = position_mask.contiguous().view(B * T, 1).bool()
