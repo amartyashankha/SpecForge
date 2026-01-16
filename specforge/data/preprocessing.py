@@ -488,12 +488,56 @@ def build_offline_eagle3_dataset(
 # ==============================
 # Vocab Mapping
 # ==============================
+def _count_tokens_for_vocab_mapping_batch(examples: Dict) -> Dict:
+    """
+    Count token frequencies from a batch of examples for vocab mapping.
+    Aggregates counts within the batch to reduce merging overhead.
+
+    Args:
+        examples: A batch of examples with input_ids and loss_mask.
+
+    Returns:
+        A dictionary with token_ids and token_counts as parallel lists.
+        PyArrow requires primitive types, so we return lists instead of dicts with int keys.
+    """
+    batch_counter = Counter()
+
+    # Handle both batched and single-item cases
+    input_ids_batch = examples["input_ids"]
+    loss_mask_batch = examples["loss_mask"]
+
+    for input_ids, loss_mask in zip(input_ids_batch, loss_mask_batch):
+        # Convert to tensor if needed
+        if not isinstance(input_ids, torch.Tensor):
+            input_ids = torch.tensor(input_ids)
+        if not isinstance(loss_mask, torch.Tensor):
+            loss_mask = torch.tensor(loss_mask)
+
+        # Flatten if needed (handle [1, seq_len] shape)
+        if input_ids.dim() > 1:
+            input_ids = input_ids.squeeze(0)
+        if loss_mask.dim() > 1:
+            loss_mask = loss_mask.squeeze(0)
+
+        masked_ids = input_ids[loss_mask == 1]
+        if len(masked_ids) > 0:
+            unique_ids, counts = masked_ids.unique(return_counts=True)
+            batch_counter.update(dict(zip(unique_ids.tolist(), counts.tolist())))
+
+    # Return as parallel lists (PyArrow can't handle dicts with int keys)
+    # We return lists with one element each to maintain batched output format
+    token_ids = list(batch_counter.keys())
+    token_counts = list(batch_counter.values())
+    return {"batch_token_ids": [token_ids], "batch_token_counts": [token_counts]}
+
+
 def generate_vocab_mapping_file(
     dataset: HFDataset,
     target_vocab_size: int,
     draft_vocab_size: int,
     cache_dir: str = "./cache/vocab_mapping",
     cache_key: str = "vocab_mapping",
+    num_proc: Optional[int] = 8,
 ) -> str:
     """
     Generate a vocab mapping file for the dataset.
@@ -504,6 +548,7 @@ def generate_vocab_mapping_file(
         draft_vocab_size: The draft vocabulary size.
         cache_dir: The directory to use for caching the vocab mapping file.
         cache_key: The key to use for caching the vocab mapping file.
+        num_proc: The number of processes to use for multiprocessing.
 
     Returns:
         The path to the vocab mapping file.
@@ -516,15 +561,28 @@ def generate_vocab_mapping_file(
         print(f"Loading vocab mapping from the cached file at: {vocab_mapping_path}")
         return vocab_mapping_path
 
-    # we first count the frequency of effectiev tokens in the dataset
+    # Count token frequencies in parallel using dataset.map()
+    # Each batch of 1000 items produces one aggregated count dict
+    print(f"Counting tokens for vocab mapping using {num_proc} processes...")
+    batch_size = 1000
+    counted_dataset = dataset.map(
+        _count_tokens_for_vocab_mapping_batch,
+        batched=True,
+        batch_size=batch_size,
+        num_proc=num_proc,
+        remove_columns=dataset.column_names,  # Remove original columns to save memory
+        desc="Counting tokens for vocab mapping",
+    )
+
+    # Aggregate batch counts - now we only have (dataset_size / batch_size) items to merge
+    # instead of dataset_size items
     token_dict = Counter()
-    for item in tqdm(dataset, desc="Counting tokens for vocab mapping"):
-        input_ids = item["input_ids"]
-        loss_mask = item["loss_mask"]
-        masked_ids = input_ids[loss_mask == 1]
-        unique_ids, counts = masked_ids.unique(return_counts=True)
-        batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))
-        token_dict.update(batch_token_dict)
+    num_batches = len(counted_dataset)
+    print(f"Aggregating {num_batches} batch counts...")
+    for item in tqdm(counted_dataset, desc="Aggregating token counts"):
+        # Reconstruct dict from parallel lists
+        batch_counts = dict(zip(item["batch_token_ids"], item["batch_token_counts"]))
+        token_dict.update(batch_counts)
 
     # generate the d2t and t2d mapping
     d2t, t2d = process_token_dict_to_mappings(

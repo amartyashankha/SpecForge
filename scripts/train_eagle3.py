@@ -173,7 +173,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     other_group.add_argument(
         "--dist-timeout",
         type=int,
-        default=20,
+        default=120,  # Increased from 20 to 120 min for large dataset preprocessing
         help="Timeout for collective communication in minutes",
     )
     other_group.add_argument(
@@ -406,6 +406,7 @@ def build_dataloaders(
             draft_vocab_size=draft_model_config.draft_vocab_size,
             cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
             cache_key=cache_key,
+            num_proc=args.build_dataset_num_proc,
         )
 
         if args.train_hidden_states_path is not None:
