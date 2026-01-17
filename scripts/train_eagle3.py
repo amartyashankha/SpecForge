@@ -375,45 +375,137 @@ def build_dataloaders(
     draft_model_config: AutoDraftModelConfig,
     processor: Optional[AutoProcessor] = None,
 ) -> Tuple[DataLoader, str, Optional[DataLoader]]:
-    # build dataloaders
+    """Build train and eval dataloaders.
+
+    Supports two data loading paths:
+    1. FAST PATH: Pre-processed Arrow cache (from preprocess_specforge_data.py)
+       - Detects arrow_cache/ and vocab_mapping.pt in train_data_path directory
+       - Loads instantly via load_from_disk()
+       - No rank_0_priority() needed, all ranks load in parallel
+
+    2. SLOW PATH: Raw JSON files (original behavior)
+       - Loads JSON, tokenizes, builds vocab mapping at training time
+       - All done on rank 0 while other ranks wait at barrier
+       - Can cause NCCL timeouts for large datasets
+    """
+    from datasets import load_from_disk
+
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 
-    # convert to dataloader
-    cache_params_string = (
-        f"{args.train_data_path}-"
-        f"{args.max_length}-"
-        f"{args.chat_template}-"
-        f"{args.target_model_path}"  # Tokenizer may also different
-    )
-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    with rank_0_priority():
-        train_eagle3_dataset = build_eagle3_dataset(
-            dataset=train_dataset,
-            tokenizer=tokenizer,
-            chat_template=args.chat_template,
-            max_length=args.max_length,
-            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-            cache_key=cache_key,
-            is_vlm=args.is_vlm,
-            is_preformatted=args.is_preformatted,
-            processor=processor,
-            num_proc=args.build_dataset_num_proc,
-        )
-        vocab_mapping_path = generate_vocab_mapping_file(
-            dataset=train_eagle3_dataset,
-            target_vocab_size=draft_model_config.vocab_size,
-            draft_vocab_size=draft_model_config.draft_vocab_size,
-            cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
-            cache_key=cache_key,
-            num_proc=args.build_dataset_num_proc,
-        )
+    # Check for pre-processed Arrow cache (FAST PATH)
+    # Expected structure: /path/to/data/arrow_cache/ and /path/to/data/vocab_mapping.pt
+    # logic to find the directory, handling both direct paths and glob patterns
+    if os.path.isdir(args.train_data_path):
+        train_data_dir = args.train_data_path.rstrip("/")
+    else:
+        # If path is a glob (e.g. /path/to/*.jsonl) or file, try to find the parent directory
+        # Split at first wildcard if present to get the base directory
+        clean_path = args.train_data_path.split("*")[0].rstrip("/")
+        if os.path.isdir(clean_path):
+            train_data_dir = clean_path
+        else:
+            # If it's a file path or non-existent dir, take dirname
+            train_data_dir = os.path.dirname(clean_path)
 
+    # Check candidates for FAST PATH
+    # Candidate 1: train_data_dir is the parent of arrow_cache (Standard Preprocess Output)
+    c1_arrow = os.path.join(train_data_dir, "arrow_cache")
+    c1_vocab = os.path.join(train_data_dir, "vocab_mapping.pt")
+
+    # Candidate 2: train_data_dir IS the arrow_cache directory (User pointed deep)
+    # (vocab mapping should be in parent)
+    c2_arrow = train_data_dir
+    c2_vocab = os.path.join(os.path.dirname(train_data_dir), "vocab_mapping.pt")
+    
+    is_fast_path = False
+    if os.path.isdir(c1_arrow) and os.path.isfile(c1_vocab):
+        arrow_cache_dir = c1_arrow
+        vocab_mapping_path_candidate = c1_vocab
+        is_fast_path = True
+    elif os.path.basename(c2_arrow) == "arrow_cache" and os.path.isdir(c2_arrow) and os.path.isfile(c2_vocab):
+        arrow_cache_dir = c2_arrow
+        vocab_mapping_path_candidate = c2_vocab
+        is_fast_path = True
+
+    if is_fast_path:
+        # FAST PATH: Load pre-processed Arrow cache
+        print_on_rank0(f"[FAST PATH] Loading pre-processed Arrow cache from {arrow_cache_dir}")
+        print_on_rank0(f"[FAST PATH] Using pre-computed vocab mapping from {vocab_mapping_path_candidate}")
+
+        # Validate vocab sizes match (if metadata exists)
+        metadata_path = os.path.join(os.path.dirname(arrow_cache_dir), "dataset_metadata.json")
+        if os.path.exists(metadata_path):
+            import json
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            expected_draft_vocab = metadata.get("draft_vocab_size")
+            expected_target_vocab = metadata.get("target_vocab_size")
+            if expected_draft_vocab and expected_draft_vocab != draft_model_config.draft_vocab_size:
+                raise ValueError(
+                    f"[FAST PATH] Vocab size mismatch! Preprocessed with draft_vocab_size={expected_draft_vocab}, "
+                    f"but draft_model_config expects {draft_model_config.draft_vocab_size}. "
+                    f"Re-run preprocessing with correct vocab sizes."
+                )
+            if expected_target_vocab and expected_target_vocab != draft_model_config.vocab_size:
+                raise ValueError(
+                    f"[FAST PATH] Vocab size mismatch! Preprocessed with target_vocab_size={expected_target_vocab}, "
+                    f"but draft_model_config expects {draft_model_config.vocab_size}. "
+                    f"Re-run preprocessing with correct vocab sizes."
+                )
+            print_on_rank0(f"[FAST PATH] Vocab sizes validated: draft={expected_draft_vocab}, target={expected_target_vocab}")
+
+        train_eagle3_dataset = load_from_disk(arrow_cache_dir)
+        train_eagle3_dataset.set_format(type="torch")
+        vocab_mapping_path = vocab_mapping_path_candidate
+
+        print_on_rank0(f"[FAST PATH] Loaded {len(train_eagle3_dataset):,} samples instantly!")
+
+        # Handle offline training (hidden states) if specified
         if args.train_hidden_states_path is not None:
             train_eagle3_dataset = build_offline_eagle3_dataset(
                 args.train_hidden_states_path,
                 args.max_length,
             )
+    else:
+        # SLOW PATH: Process from JSON files (original behavior)
+        print_on_rank0(f"[SLOW PATH] No Arrow cache found, processing from JSON files")
+        print_on_rank0(f"[SLOW PATH] To speed this up, run preprocess_specforge_data.py first")
+
+        cache_params_string = (
+            f"{args.train_data_path}-"
+            f"{args.max_length}-"
+            f"{args.chat_template}-"
+            f"{args.target_model_path}"
+        )
+        cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+        train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+        with rank_0_priority():
+            train_eagle3_dataset = build_eagle3_dataset(
+                dataset=train_dataset,
+                tokenizer=tokenizer,
+                chat_template=args.chat_template,
+                max_length=args.max_length,
+                cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+                cache_key=cache_key,
+                is_vlm=args.is_vlm,
+                is_preformatted=args.is_preformatted,
+                processor=processor,
+                num_proc=args.build_dataset_num_proc,
+            )
+            vocab_mapping_path = generate_vocab_mapping_file(
+                dataset=train_eagle3_dataset,
+                target_vocab_size=draft_model_config.vocab_size,
+                draft_vocab_size=draft_model_config.draft_vocab_size,
+                cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
+                cache_key=cache_key,
+                num_proc=args.build_dataset_num_proc,
+            )
+
+            if args.train_hidden_states_path is not None:
+                train_eagle3_dataset = build_offline_eagle3_dataset(
+                    args.train_hidden_states_path,
+                    args.max_length,
+                )
 
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
