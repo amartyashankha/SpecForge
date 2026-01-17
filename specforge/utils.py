@@ -61,21 +61,90 @@ def print_on_rank0(message):
         logger.info(message)
 
 
+def is_valid_checkpoint(folder: str) -> bool:
+    """
+    Validate that a checkpoint directory contains the required files.
+
+    A valid checkpoint must contain training_state.pt for resume functionality.
+    This prevents selecting a partially-written checkpoint from a preempted job.
+
+    Args:
+        folder: Path to the checkpoint directory
+
+    Returns:
+        True if the checkpoint is valid and complete, False otherwise
+    """
+    training_state_path = os.path.join(folder, "training_state.pt")
+    config_path = os.path.join(folder, "config.json")
+    # Both training_state.pt and config.json are required for a valid checkpoint
+    return os.path.isfile(training_state_path) and os.path.isfile(config_path)
+
+
 def get_last_checkpoint(folder, prefix="epoch"):
+    """
+    Find the most recent valid checkpoint in the given folder.
+
+    Supports checkpoint directories named:
+    - epoch_{N}_step_{S} (current format from save_checkpoints)
+    - epoch_{N} (legacy format, for backward compatibility)
+
+    Args:
+        folder: The output directory containing checkpoint subdirectories
+        prefix: The prefix for checkpoint directories (default: "epoch")
+
+    Returns:
+        The path to the most recent valid checkpoint, or None if no valid
+        checkpoints are found.
+    """
+    if not os.path.isdir(folder):
+        return None
+
     content = os.listdir(folder)
-    _re_checkpoint = re.compile(r"^" + prefix + r"_(\d+)$")
-    checkpoints = [
-        path
-        for path in content
-        if _re_checkpoint.search(path) is not None
-        and os.path.isdir(os.path.join(folder, path))
-    ]
-    if len(checkpoints) == 0:
-        return
-    return os.path.join(
-        folder,
-        max(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0])),
-    )
+
+    # Primary pattern: epoch_{N}_step_{S} (current format)
+    _re_checkpoint_with_step = re.compile(r"^" + prefix + r"_(\d+)_step_(\d+)$")
+    # Fallback pattern: epoch_{N} (legacy format)
+    _re_checkpoint_legacy = re.compile(r"^" + prefix + r"_(\d+)$")
+
+    checkpoints_with_step = []
+    checkpoints_legacy = []
+
+    for path in content:
+        full_path = os.path.join(folder, path)
+        if not os.path.isdir(full_path):
+            continue
+
+        # Skip invalid checkpoints (missing training_state.pt or config.json)
+        if not is_valid_checkpoint(full_path):
+            logger.warning(
+                f"Skipping invalid checkpoint (missing required files): {full_path}"
+            )
+            continue
+
+        match_with_step = _re_checkpoint_with_step.search(path)
+        if match_with_step is not None:
+            epoch = int(match_with_step.group(1))
+            step = int(match_with_step.group(2))
+            checkpoints_with_step.append((path, epoch, step))
+            continue
+
+        match_legacy = _re_checkpoint_legacy.search(path)
+        if match_legacy is not None:
+            epoch = int(match_legacy.group(1))
+            checkpoints_legacy.append((path, epoch))
+
+    # Prefer checkpoints with step information (current format)
+    if checkpoints_with_step:
+        # Sort by step number (global step) to find the truly latest checkpoint
+        best = max(checkpoints_with_step, key=lambda x: x[2])
+        return os.path.join(folder, best[0])
+
+    # Fallback to legacy checkpoints if no step-based checkpoints found
+    if checkpoints_legacy:
+        best = max(checkpoints_legacy, key=lambda x: x[1])
+        return os.path.join(folder, best[0])
+
+    return None
 
 
 def generate_draft_model_config(

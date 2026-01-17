@@ -319,7 +319,23 @@ def sanity_check(args: Namespace) -> None:
     args.target_batch_size = args.tp_size * args.batch_size
 
 
-def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
+def build_draft_model(
+    args: Namespace,
+) -> Tuple[AutoDraftModelConfig, nn.Module, Optional[str]]:
+    """Build the draft model for EAGLE3 training.
+
+    Args:
+        args: The arguments for the training script.
+
+    Returns:
+        A tuple of:
+        - draft_model_config: The configuration for the draft model
+        - draft_model: The initialized draft model
+        - resume_checkpoint_path: Path to checkpoint for training state restoration,
+            or None if not resuming from a checkpoint with training state.
+            Note: This is only set when --resume finds a checkpoint in output_dir,
+            NOT when using --ckpt-dir (which is for finetuning from a base model).
+    """
     # Handle draft model config
     if args.draft_model_config is None:
         # Auto-generate and save config file
@@ -332,7 +348,11 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
     # Handle base ckpt, config file
+    # Note: --ckpt-dir is for finetuning from a pretrained draft model (e.g., Tengyunw)
+    # It does NOT have training state (optimizer, scheduler, global_step) to restore
     draft_model_last_checkpoint = None
+    resume_checkpoint_path = None  # Only set when resuming with training state
+
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
             # FIX: load config as object, not string path (was causing .vocab_size crash)
@@ -346,11 +366,17 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
                 f"Provided base model dir {args.ckpt_dir} is not a valid directory."
             )
 
-    # detecting last ckpt for draft model
+    # Detecting last ckpt for draft model when resuming
+    # This is the checkpoint that has training state (optimizer, scheduler, global_step)
     if args.resume and os.path.isdir(args.output_dir):
-        print_on_rank0(args.output_dir)
-        draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
-        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+        print_on_rank0(f"Checking for checkpoints in: {args.output_dir}")
+        found_checkpoint = get_last_checkpoint(args.output_dir)
+        if found_checkpoint:
+            draft_model_last_checkpoint = found_checkpoint
+            resume_checkpoint_path = found_checkpoint  # Mark this for training state restoration
+            print_on_rank0(f"Resume checkpoint detected: {resume_checkpoint_path}")
+        else:
+            print_on_rank0("No valid checkpoint found, starting fresh")
 
     if draft_model_last_checkpoint:
         draft_model = AutoEagle3DraftModel.from_pretrained(
@@ -367,7 +393,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
-    return draft_model_config, draft_model
+    return draft_model_config, draft_model, resume_checkpoint_path
 
 
 def build_dataloaders(
@@ -514,6 +540,7 @@ def build_dataloaders(
         shuffle=True,
         process_group=get_dp_group(),
         is_vlm=args.is_vlm,
+        seed=args.seed,  # Ensure reproducible shuffling across restarts
     )
 
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
@@ -541,6 +568,7 @@ def build_dataloaders(
             shuffle=False,
             process_group=get_dp_group(),
             is_vlm=args.is_vlm,
+            seed=args.seed,  # Consistent seeding with train dataloader
         )
         print_with_rank("Initialized eval dataloader")
     else:
@@ -720,7 +748,7 @@ def main():
     # ================================================
     # 2. Build models
     # ================================================
-    draft_model_config, draft_model = build_draft_model(args)
+    draft_model_config, draft_model, resume_checkpoint_path = build_draft_model(args)
     target_model, processor = build_target_model(args, draft_model_config, is_online)
 
     # ================================================
@@ -792,11 +820,44 @@ def main():
     print_with_rank("Initialized optimizer and scheduler")
 
     # ================================================
+    # 5.1 Restore training state if resuming
+    # ================================================
+    # Initialize defaults - will be overwritten if resuming
+    global_step = 0
+    start_epoch = 0
+
+    if resume_checkpoint_path is not None:
+        training_state_path = os.path.join(resume_checkpoint_path, "training_state.pt")
+        if os.path.isfile(training_state_path):
+            print_on_rank0(f"Loading training state from: {training_state_path}")
+            # Load on CPU first to avoid GPU memory fragmentation
+            training_state = torch.load(training_state_path, map_location="cpu")
+
+            # Restore optimizer and scheduler states
+            # The training_state contains optimizer_state_dict and scheduler_state_dict
+            # from optimizer.state_dict() call in save_checkpoints
+            optimizer.load_state_dict(training_state)
+
+            # Restore training progress
+            global_step = training_state.get("global_step", 0)
+            start_epoch = training_state.get("epoch", 0)
+
+            print_on_rank0(
+                f"Resumed training state: epoch={start_epoch}, global_step={global_step}"
+            )
+            print_on_rank0(
+                f"Current LR after restore: {optimizer.get_learning_rate():.2e}"
+            )
+        else:
+            print_on_rank0(
+                f"Warning: training_state.pt not found at {training_state_path}, "
+                "starting from scratch (model weights were loaded but optimizer state lost)"
+            )
+
+    # ================================================
     # 6. Build tracker
     # ================================================
     tracker = build_tracker(args, parser)
-    global_step = 0
-    start_epoch = 0
     dist.barrier()
 
     last_time = time.time()

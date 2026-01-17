@@ -89,7 +89,12 @@ class NoOpTracker(Tracker):
 
 
 class WandbTracker(Tracker):
-    """Tracks experiments using Weights & Biases."""
+    """Tracks experiments using Weights & Biases.
+
+    Supports automatic run resumption when training restarts (e.g., after preemption).
+    The run_id is derived from wandb_name (which contains the run timestamp) to ensure
+    consistency across restarts. This matches the approach used in DFlash.
+    """
 
     @classmethod
     def validate_args(cls, parser, args):
@@ -125,12 +130,42 @@ class WandbTracker(Tracker):
                 "  3. `wandb login` command"
             )
 
+    @staticmethod
+    def _sanitize_run_id(name: str) -> str:
+        """Sanitize a run name into a valid WandB run_id.
+
+        WandB run_id must be alphanumeric + dashes/underscores, max 128 chars.
+        This matches the approach used in DFlash's train_dflash.py.
+
+        Args:
+            name: The run name (e.g., "bs:4_lr:5e-05__20260116_191401")
+
+        Returns:
+            A sanitized string suitable for WandB run_id.
+        """
+        # Replace characters that are invalid in WandB run_id
+        sanitized = name.replace(":", "-").replace(".", "-")
+        return sanitized[:128]
+
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
         if self.rank == 0:
             wandb.login(key=args.wandb_key)
+
+            # Use wandb_name (which contains the timestamp from Modal entrypoint)
+            # as the run_id. This ensures the same run is resumed after preemption.
+            # This matches the approach used in DFlash's train_dflash.py.
+            run_id = self._sanitize_run_id(args.wandb_name)
+
+            # Use resume="allow" to:
+            # - Create a new run if run_id doesn't exist
+            # - Resume the existing run if run_id exists (e.g., after preemption)
             wandb.init(
-                project=args.wandb_project, name=args.wandb_name, config=vars(args)
+                project=args.wandb_project,
+                name=args.wandb_name,
+                config=vars(args),
+                id=run_id,
+                resume="allow",
             )
             self.is_initialized = True
 

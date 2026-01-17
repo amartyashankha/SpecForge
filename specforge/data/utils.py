@@ -227,6 +227,7 @@ def prepare_dp_dataloaders(
     shuffle: Optional[bool] = False,
     is_vlm: Optional[bool] = False,
     prefetch_factor: Optional[int] = 2,
+    seed: Optional[int] = None,
     **dataloader_kwargs
 ) -> DataLoader:
     """
@@ -240,6 +241,10 @@ def prepare_dp_dataloaders(
         pin_memory: Whether to pin memory for data loading.
         shuffle: Whether to shuffle the dataset.
         is_vlm: Whether the dataset is a vision-language model dataset.
+        prefetch_factor: Number of samples to prefetch per worker.
+        seed: Random seed for reproducible shuffling. When resuming training,
+            this ensures the data order is deterministic across restarts.
+            If None, uses PyTorch's default (non-deterministic) behavior.
         **dataloader_kwargs: Additional keyword arguments for the DataLoader.
 
     Returns:
@@ -247,9 +252,13 @@ def prepare_dp_dataloaders(
     """
     world_size = dist.get_world_size(process_group)
     rank = dist.get_rank(process_group)
-    sampler = DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
-    )
+
+    # Pass seed to DistributedSampler for reproducible shuffling across restarts
+    sampler_kwargs = {"num_replicas": world_size, "rank": rank, "shuffle": shuffle}
+    if seed is not None:
+        sampler_kwargs["seed"] = seed
+
+    sampler = DistributedSampler(dataset, **sampler_kwargs)
     if is_vlm:
         datacollator_cls = VlmDataCollatorWithPadding
     else:
