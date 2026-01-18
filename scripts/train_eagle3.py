@@ -369,14 +369,20 @@ def build_draft_model(
     # Detecting last ckpt for draft model when resuming
     # This is the checkpoint that has training state (optimizer, scheduler, global_step)
     if args.resume and os.path.isdir(args.output_dir):
-        print_on_rank0(f"Checking for checkpoints in: {args.output_dir}")
+        if dist.get_rank() == 0:
+            print(f"[RESUME] Checking for checkpoints in: {args.output_dir}", flush=True)
         found_checkpoint = get_last_checkpoint(args.output_dir)
         if found_checkpoint:
             draft_model_last_checkpoint = found_checkpoint
             resume_checkpoint_path = found_checkpoint  # Mark this for training state restoration
-            print_on_rank0(f"Resume checkpoint detected: {resume_checkpoint_path}")
+            if dist.get_rank() == 0:
+                print(f"[RESUME] ✓ Checkpoint detected: {resume_checkpoint_path}", flush=True)
         else:
-            print_on_rank0("No valid checkpoint found, starting fresh")
+            if dist.get_rank() == 0:
+                print("[RESUME] ✗ No valid checkpoint found, starting fresh", flush=True)
+    elif args.resume:
+        if dist.get_rank() == 0:
+            print(f"[RESUME] Output dir does not exist yet: {args.output_dir}", flush=True)
 
     if draft_model_last_checkpoint:
         draft_model = AutoEagle3DraftModel.from_pretrained(
@@ -829,9 +835,14 @@ def main():
     if resume_checkpoint_path is not None:
         training_state_path = os.path.join(resume_checkpoint_path, "training_state.pt")
         if os.path.isfile(training_state_path):
-            print_on_rank0(f"Loading training state from: {training_state_path}")
+            if dist.get_rank() == 0:
+                print(f"[RESUME] Loading training state from: {training_state_path}", flush=True)
             # Load on CPU first to avoid GPU memory fragmentation
-            training_state = torch.load(training_state_path, map_location="cpu")
+            # weights_only=False required because training_state contains argparse.Namespace
+            # This is safe since we're loading our own checkpoint files
+            training_state = torch.load(
+                training_state_path, map_location="cpu", weights_only=False
+            )
 
             # Restore optimizer and scheduler states
             # The training_state contains optimizer_state_dict and scheduler_state_dict
@@ -842,17 +853,19 @@ def main():
             global_step = training_state.get("global_step", 0)
             start_epoch = training_state.get("epoch", 0)
 
-            print_on_rank0(
-                f"Resumed training state: epoch={start_epoch}, global_step={global_step}"
-            )
-            print_on_rank0(
-                f"Current LR after restore: {optimizer.get_learning_rate():.2e}"
-            )
+            if dist.get_rank() == 0:
+                print(
+                    f"[RESUME] ✓ Restored: epoch={start_epoch}, global_step={global_step}, "
+                    f"lr={optimizer.get_learning_rate():.2e}",
+                    flush=True,
+                )
         else:
-            print_on_rank0(
-                f"Warning: training_state.pt not found at {training_state_path}, "
-                "starting from scratch (model weights were loaded but optimizer state lost)"
-            )
+            if dist.get_rank() == 0:
+                print(
+                    f"[RESUME] ✗ training_state.pt not found at {training_state_path}, "
+                    "optimizer state lost",
+                    flush=True,
+                )
 
     # ================================================
     # 6. Build tracker
@@ -865,7 +878,11 @@ def main():
     # ================================================
     # 7. Start training
     # ================================================
-    print_on_rank0(f"Starting training from epoch {start_epoch}")
+    if dist.get_rank() == 0:
+        print(
+            f"[TRAIN] Starting from epoch={start_epoch}, global_step={global_step}",
+            flush=True,
+        )
 
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
@@ -928,6 +945,7 @@ def main():
                 avg_acc = sum(acces) / len(acces)
                 progress_bar.set_postfix(
                     {
+                        "step": global_step,
                         "loss": f"{avg_loss:.2f}",
                         "acc": f"{avg_acc:.2f}",
                         "time": f"{time_per_step:.2f}s",
