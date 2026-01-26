@@ -500,8 +500,8 @@ def build_dataloaders(
             )
     else:
         # SLOW PATH: Process from JSON files (original behavior)
-        print_on_rank0(f"[SLOW PATH] No Arrow cache found, processing from JSON files")
-        print_on_rank0(f"[SLOW PATH] To speed this up, run preprocess_specforge_data.py first")
+        print_on_rank0("[SLOW PATH] No Arrow cache found, processing from JSON files")
+        print_on_rank0("[SLOW PATH] To speed this up, run preprocess_specforge_data.py first")
 
         cache_params_string = (
             f"{args.train_data_path}-"
@@ -592,6 +592,7 @@ def save_checkpoints(
     step: int,
     eagle3_model: nn.Module,
     optimizer: Optimizer,
+    step_in_epoch: int = 0,  # NEW: Track position within epoch for intra-epoch resume
 ):
     epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
     if dist.get_rank() == 0:
@@ -603,6 +604,7 @@ def save_checkpoints(
         state_to_save = {
             "epoch": epoch,
             "global_step": step,
+            "step_in_epoch": step_in_epoch,  # NEW: For intra-epoch resume
             "args": args,
         }
         state_to_save.update(optimizer.state_dict())
@@ -831,6 +833,7 @@ def main():
     # Initialize defaults - will be overwritten if resuming
     global_step = 0
     start_epoch = 0
+    step_in_epoch_resume = 0  # NEW: For intra-epoch resume (skip already-processed batches)
 
     if resume_checkpoint_path is not None:
         training_state_path = os.path.join(resume_checkpoint_path, "training_state.pt")
@@ -852,11 +855,13 @@ def main():
             # Restore training progress
             global_step = training_state.get("global_step", 0)
             start_epoch = training_state.get("epoch", 0)
+            # NEW: Restore intra-epoch position for proper resume (avoids reprocessing batches)
+            step_in_epoch_resume = training_state.get("step_in_epoch", 0)
 
             if dist.get_rank() == 0:
                 print(
                     f"[RESUME] ✓ Restored: epoch={start_epoch}, global_step={global_step}, "
-                    f"lr={optimizer.get_learning_rate():.2e}",
+                    f"step_in_epoch={step_in_epoch_resume}, lr={optimizer.get_learning_rate():.2e}",
                     flush=True,
                 )
         else:
@@ -889,14 +894,35 @@ def main():
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
 
+        # Log skip info if resuming mid-epoch
+        if epoch == start_epoch and step_in_epoch_resume > 0:
+            if dist.get_rank() == 0:
+                print(
+                    f"[RESUME] Skipping {step_in_epoch_resume} batches in epoch {epoch} "
+                    f"(already processed before checkpoint)",
+                    flush=True,
+                )
+
         if dist.get_rank() == 0:
             progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+                enumerate(train_dataloader), 
+                desc=f"Training Epoch {epoch}", 
+                leave=True,
+                total=len(train_dataloader),
             )
         else:
-            progress_bar = train_dataloader
+            progress_bar = enumerate(train_dataloader)
 
-        for data in progress_bar:
+        # Track current position in epoch for checkpointing
+        current_step_in_epoch = 0
+
+        for batch_idx, data in progress_bar:
+            # INTRA-EPOCH RESUME: Skip already-processed batches
+            # This is safe because DistributedSampler is deterministic with same seed + epoch
+            if epoch == start_epoch and batch_idx < step_in_epoch_resume:
+                continue
+            
+            current_step_in_epoch = batch_idx + 1  # Track position (1-indexed for next resume)
             global_step += 1
 
             # ================================================
@@ -993,11 +1019,21 @@ def main():
             # 7.3 Save Checkpoints
             # ================================================
             if global_step % args.save_interval == 0:
-                # Save the model
-                save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+                # Save the model with intra-epoch position for proper resume
+                save_checkpoints(
+                    args, epoch, global_step, eagle3_model, optimizer, 
+                    step_in_epoch=current_step_in_epoch
+                )
 
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
+
+        # Reset intra-epoch skip after first resumed epoch completes
+        # (subsequent epochs start from batch 0)
+        if epoch == start_epoch and step_in_epoch_resume > 0:
+            if dist.get_rank() == 0:
+                print(f"[RESUME] Epoch {epoch} complete, skip disabled for subsequent epochs", flush=True)
+            step_in_epoch_resume = 0
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
