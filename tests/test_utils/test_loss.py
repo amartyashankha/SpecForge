@@ -6,6 +6,9 @@ from specforge.core.loss import LogSoftmaxLoss, _compute_loss
 
 from .utils import norm_tensor
 
+# Default exponential decay base for position-based loss weighting
+DEFAULT_LOSS_DECAY_BASE = 0.8
+
 
 class TestLogSoftmaxLoss(unittest.TestCase):
 
@@ -69,7 +72,7 @@ class TestLogSoftmaxLoss(unittest.TestCase):
             plosses.append(output1)
             plosses_compare.append(output2)
 
-        ploss_weight = [0.8**i for i in range(len(plosses))]
+        ploss_weight = [DEFAULT_LOSS_DECAY_BASE ** i for i in range(len(plosses))]
         ploss = (
             sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
             / self.TTT_LENGTH

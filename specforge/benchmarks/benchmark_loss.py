@@ -6,6 +6,7 @@ import torch
 from specforge.core.loss import LogSoftmaxLoss, _compute_loss
 
 TTT_LENGTH = 7
+DEFAULT_LOSS_DECAY_BASE = 0.8  # Default exponential decay base for position-based loss weighting
 
 
 def benchmark_loss_method(
@@ -52,7 +53,7 @@ def benchmark_loss_method(
                 loss = _compute_loss(logits, target, position_mask)
             plosses.append(loss)
 
-        ploss_weight = [0.8**i for i in range(len(plosses))]
+        ploss_weight = [DEFAULT_LOSS_DECAY_BASE ** i for i in range(len(plosses))]
         ploss = (
             sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
             / TTT_LENGTH
