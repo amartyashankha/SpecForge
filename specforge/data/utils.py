@@ -116,6 +116,11 @@ class DataCollatorWithPadding:
             batch["target"] = torch.cat(
                 [self.paddingtensor(item["target"], max_length) for item in features]
             )
+        # Pass through source_id for multi-source logging (if present in dataset)
+        if all("source_id" in item for item in features):
+            batch["source_id"] = torch.tensor(
+                [item["source_id"] for item in features], dtype=torch.long
+            )
         return batch
 
 
@@ -214,6 +219,11 @@ class VlmDataCollatorWithPadding:
             )
             batch["target"] = torch.cat(
                 [self.paddingtensor(item["target"], max_length) for item in features]
+            )
+        # Pass through source_id for multi-source logging (if present in dataset)
+        if all("source_id" in item for item in features):
+            batch["source_id"] = torch.tensor(
+                [item["source_id"] for item in features], dtype=torch.long
             )
         return batch
 
