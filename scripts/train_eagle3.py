@@ -1,10 +1,12 @@
 import argparse
 import hashlib
+import json
 import math
 import os
 import time
 from argparse import ArgumentParser, Namespace
-from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -51,6 +53,111 @@ from specforge.utils import (
     print_with_rank,
     rank_0_priority,
 )
+
+
+# === External Schedule Support ===
+# Default exponential decay base for position-based loss weighting
+DEFAULT_LOSS_DECAY_BASE = 0.8
+
+
+@dataclass
+class ExternalSchedule:
+    """Manager for external training schedules (loss position weights).
+
+    Handles loading and querying of position-based loss weighting schedules.
+    Schedule format (YAML):
+        loss_position_weights:
+          type: "step_based"
+          schedule:
+            - step_range: [0, 5000]
+              weights: [1.0, 0.8, 0.64, 0.51, 0.41, 0.33, 0.26]
+            - step_range: [5000, null]
+              weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    """
+    schedule_path: Optional[str] = None
+    loss_entries: List[Dict[str, Any]] = field(default_factory=list)
+    checksum: str = ""
+    description: str = ""
+    default_base: float = DEFAULT_LOSS_DECAY_BASE  # Configurable decay base
+
+    @classmethod
+    def from_file(cls, schedule_path: str, default_base: float = DEFAULT_LOSS_DECAY_BASE) -> "ExternalSchedule":
+        """Load schedule from a YAML file."""
+        import yaml
+
+        if not os.path.exists(schedule_path):
+            raise FileNotFoundError(f"Schedule file not found: {schedule_path}")
+
+        with open(schedule_path) as f:
+            config = yaml.safe_load(f)
+
+        # Compute checksum
+        config_json = json.dumps(config, sort_keys=True)
+        checksum = hashlib.sha256(config_json.encode()).hexdigest()[:16]
+
+        # Parse loss position weights
+        loss_entries = []
+        if "loss_position_weights" in config:
+            loss_config = config["loss_position_weights"]
+            if loss_config.get("type") == "step_based":
+                loss_entries = loss_config.get("schedule", [])
+
+        return cls(
+            schedule_path=schedule_path,
+            loss_entries=loss_entries,
+            checksum=checksum,
+            description=config.get("description", ""),
+            default_base=default_base,
+        )
+
+    @classmethod
+    def default(cls, default_base: float = DEFAULT_LOSS_DECAY_BASE) -> "ExternalSchedule":
+        """Create default schedule (exponential decay base^i)."""
+        return cls(
+            schedule_path=None,
+            loss_entries=[],
+            checksum="default",
+            description=f"Default exponential decay ({default_base}^i)",
+            default_base=default_base,
+        )
+
+    def get_loss_weights(self, step: int, num_positions: int) -> List[float]:
+        """Get position-based loss weights for a given training step."""
+        if not self.loss_entries:
+            return [self.default_base ** i for i in range(num_positions)]
+
+        # Find applicable entry
+        for entry in self.loss_entries:
+            step_range = entry.get("step_range", [0, None])
+            step_start = step_range[0] if step_range[0] is not None else 0
+            step_end = step_range[1]
+
+            if step >= step_start and (step_end is None or step < step_end):
+                weights = entry.get("weights", [1.0])
+                # Pad or truncate to num_positions
+                if len(weights) < num_positions:
+                    weights = weights + [weights[-1]] * (num_positions - len(weights))
+                elif len(weights) > num_positions:
+                    weights = weights[:num_positions]
+                return weights
+
+        # Fallback to last entry or default
+        if self.loss_entries:
+            weights = self.loss_entries[-1].get("weights", [1.0])
+            if len(weights) < num_positions:
+                weights = weights + [weights[-1]] * (num_positions - len(weights))
+            elif len(weights) > num_positions:
+                weights = weights[:num_positions]
+            return weights
+
+        return [1.0] * num_positions
+
+    def to_checkpoint_state(self) -> Dict[str, Any]:
+        """Get schedule state for checkpoint."""
+        return {
+            "schedule_path": self.schedule_path,
+            "schedule_checksum": self.checksum,
+        }
 
 
 def parse_args() -> Tuple[ArgumentParser, Namespace]:
@@ -130,6 +237,20 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         type=int,
         default=7,
         help="The length for Test-Time Training (TTT).",
+    )
+    training_group.add_argument(
+        "--loss-schedule-path",
+        type=str,
+        default=None,
+        help="Path to YAML file with external loss position weights schedule. "
+             "If not provided, uses default exponential decay.",
+    )
+    training_group.add_argument(
+        "--loss-decay-base",
+        type=float,
+        default=DEFAULT_LOSS_DECAY_BASE,
+        help=f"Base for exponential position loss decay (default: {DEFAULT_LOSS_DECAY_BASE}). "
+             "Weight for position i is base^i. Only used when no --loss-schedule-path is provided.",
     )
     training_group.add_argument("--resume", action="store_true")
     training_group.add_argument(
@@ -448,7 +569,7 @@ def build_dataloaders(
     # (vocab mapping should be in parent)
     c2_arrow = train_data_dir
     c2_vocab = os.path.join(os.path.dirname(train_data_dir), "vocab_mapping.pt")
-    
+
     is_fast_path = False
     if os.path.isdir(c1_arrow) and os.path.isfile(c1_vocab):
         arrow_cache_dir = c1_arrow
@@ -592,7 +713,8 @@ def save_checkpoints(
     step: int,
     eagle3_model: nn.Module,
     optimizer: Optimizer,
-    step_in_epoch: int = 0,  # NEW: Track position within epoch for intra-epoch resume
+    step_in_epoch: int = 0,  # Track position within epoch for intra-epoch resume
+    loss_schedule: Optional[ExternalSchedule] = None,  # NEW: External loss schedule
 ):
     epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
     if dist.get_rank() == 0:
@@ -604,9 +726,12 @@ def save_checkpoints(
         state_to_save = {
             "epoch": epoch,
             "global_step": step,
-            "step_in_epoch": step_in_epoch,  # NEW: For intra-epoch resume
+            "step_in_epoch": step_in_epoch,  # For intra-epoch resume
             "args": args,
         }
+        # NEW: Save schedule state for checkpoint validation on resume
+        if loss_schedule is not None:
+            state_to_save["loss_schedule"] = loss_schedule.to_checkpoint_state()
         state_to_save.update(optimizer.state_dict())
         draft_model_state_dict = {
             k.replace("draft_model.", ""): v
@@ -681,9 +806,29 @@ def run_forward(
 
 
 def run_backward_and_update(
-    args: Namespace, plosses: List[torch.Tensor], optimizer: Optimizer, global_step: int
+    args: Namespace,
+    plosses: List[torch.Tensor],
+    optimizer: Optimizer,
+    global_step: int,
+    loss_schedule: Optional["ExternalSchedule"] = None,  # NEW: External schedule for loss weights
 ) -> None:
-    ploss_weight = [0.8**i for i in range(len(plosses))]
+    """Apply position-weighted loss and update optimizer.
+
+    Args:
+        args: Training arguments
+        plosses: Per-position losses from the model
+        optimizer: The optimizer
+        global_step: Current global training step
+        loss_schedule: External schedule for dynamic loss weights.
+                      Should always be provided (use ExternalSchedule.default() if none specified).
+    """
+    # Get loss weights from schedule (or use default constant)
+    if loss_schedule is not None:
+        ploss_weight = loss_schedule.get_loss_weights(global_step, len(plosses))
+    else:
+        # Fallback: use default constant (shouldn't happen if caller uses ExternalSchedule.default())
+        ploss_weight = [DEFAULT_LOSS_DECAY_BASE ** i for i in range(len(plosses))]
+
     ploss = (
         sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
         / args.draft_accumulation_steps
@@ -702,6 +847,8 @@ def record_metrcs(
     tracker: Tracker,
     optimizer: Optional[Optimizer] = None,
     mode: str = "train",
+    source_ids: Optional[torch.Tensor] = None,
+    source_registry: Optional[Dict[str, str]] = None,
 ) -> None:
     logdict = {}
 
@@ -727,6 +874,17 @@ def record_metrcs(
         print_on_rank0(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
         )
+
+    # Log per-source distribution if available (with meaningful names)
+    if source_ids is not None and source_ids.numel() > 0:
+        unique_sources, counts = source_ids.unique(return_counts=True)
+        total_samples = source_ids.numel()
+        registry = source_registry or {}
+        for sid, cnt in zip(unique_sources.tolist(), counts.tolist()):
+            # Use source name from registry if available, otherwise fall back to id
+            source_name = registry.get(str(sid), str(sid))
+            logdict[f"{mode}/source_ratio/{source_name}"] = cnt / total_samples
+
     tracker.log(logdict, step=global_step)
 
 
@@ -754,6 +912,18 @@ def main():
     print_with_rank("Initialized distributed environment")
 
     # ================================================
+    # 1.5 Load External Schedule (if provided)
+    # ================================================
+    if args.loss_schedule_path:
+        loss_schedule = ExternalSchedule.from_file(args.loss_schedule_path, default_base=args.loss_decay_base)
+        print_on_rank0(f"[SCHEDULE] Loaded loss schedule from {args.loss_schedule_path}")
+        print_on_rank0(f"[SCHEDULE] Description: {loss_schedule.description}")
+        print_on_rank0(f"[SCHEDULE] Checksum: {loss_schedule.checksum}")
+    else:
+        loss_schedule = ExternalSchedule.default(default_base=args.loss_decay_base)
+        print_on_rank0(f"[SCHEDULE] Using default exponential decay ({args.loss_decay_base}^i)")
+
+    # ================================================
     # 2. Build models
     # ================================================
     draft_model_config, draft_model, resume_checkpoint_path = build_draft_model(args)
@@ -769,6 +939,21 @@ def main():
     # we load the vocab mapping then
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
+
+    # Load source registry for meaningful per-source logging
+    source_registry = {}
+    metadata_paths = [
+        os.path.join(args.train_data_path, "dataset_metadata.json"),
+        os.path.join(os.path.dirname(args.train_data_path), "dataset_metadata.json"),
+    ]
+    for metadata_path in metadata_paths:
+        if os.path.exists(metadata_path):
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            source_registry = metadata.get("source_registry", {})
+            if source_registry:
+                print_on_rank0(f"[SOURCE] Loaded source registry: {source_registry}")
+            break
 
     # Calculate total steps if not provided
     if args.total_steps is None:
@@ -905,8 +1090,8 @@ def main():
 
         if dist.get_rank() == 0:
             progress_bar = tqdm(
-                enumerate(train_dataloader), 
-                desc=f"Training Epoch {epoch}", 
+                enumerate(train_dataloader),
+                desc=f"Training Epoch {epoch}",
                 leave=True,
                 total=len(train_dataloader),
             )
@@ -921,7 +1106,7 @@ def main():
             # This is safe because DistributedSampler is deterministic with same seed + epoch
             if epoch == start_epoch and batch_idx < step_in_epoch_resume:
                 continue
-            
+
             current_step_in_epoch = batch_idx + 1  # Track position (1-indexed for next resume)
             global_step += 1
 
@@ -953,15 +1138,20 @@ def main():
             # ================================================
             # 7.1 Training Step
             # ================================================
+            # Extract source_id for per-source logging (if present in batch)
+            batch_source_ids = data.pop("source_id", None)
+
             plosses, acces = run_forward(
                 args, eagle3_model, data, target_model, is_online
             )
-            run_backward_and_update(args, plosses, optimizer, global_step)
+            run_backward_and_update(args, plosses, optimizer, global_step, loss_schedule)
 
             # log training metrics
             if global_step % args.log_interval == 0:
                 record_metrcs(
-                    args, acces, plosses, global_step, tracker, optimizer, mode="train"
+                    args, acces, plosses, global_step, tracker, optimizer, mode="train",
+                    source_ids=batch_source_ids,
+                    source_registry=source_registry,
                 )
 
             if dist.get_rank() == 0:
@@ -989,8 +1179,14 @@ def main():
                 draft_model.eval()
                 eval_acces = [[] for _ in range(eagle3_model.length)]
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
+                eval_source_ids = []  # Collect source_ids across all eval batches
 
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
+                    # Extract source_id for per-source logging (if present in batch)
+                    eval_batch_source_ids = data.pop("source_id", None)
+                    if eval_batch_source_ids is not None:
+                        eval_source_ids.append(eval_batch_source_ids)
+
                     with torch.no_grad():
                         plosses, acces = run_forward(
                             args, eagle3_model, data, target_model, is_online
@@ -1006,6 +1202,9 @@ def main():
                 eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
                 eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
 
+                # Concatenate all eval source_ids for distribution logging
+                all_eval_source_ids = torch.cat(eval_source_ids) if eval_source_ids else None
+
                 record_metrcs(
                     args,
                     eval_acces,
@@ -1013,16 +1212,19 @@ def main():
                     global_step,
                     tracker,
                     mode="eval",
+                    source_ids=all_eval_source_ids,
+                    source_registry=source_registry,
                 )
 
             # ================================================
             # 7.3 Save Checkpoints
             # ================================================
             if global_step % args.save_interval == 0:
-                # Save the model with intra-epoch position for proper resume
+                # Save the model with intra-epoch position and schedule state for proper resume
                 save_checkpoints(
-                    args, epoch, global_step, eagle3_model, optimizer, 
-                    step_in_epoch=current_step_in_epoch
+                    args, epoch, global_step, eagle3_model, optimizer,
+                    step_in_epoch=current_step_in_epoch,
+                    loss_schedule=loss_schedule,
                 )
 
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
