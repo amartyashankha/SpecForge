@@ -61,12 +61,59 @@ def print_on_rank0(message):
         logger.info(message)
 
 
+CHECKPOINT_COMPLETE_MARKER = "checkpoint_complete.json"
+
+
+def _has_model_weights(folder: str) -> bool:
+    """Check if a checkpoint directory contains model weight files.
+
+    HuggingFace save_pretrained() writes model.safetensors (modern) or
+    pytorch_model.bin (legacy). Either is acceptable.
+    """
+    return os.path.isfile(os.path.join(folder, "model.safetensors")) or os.path.isfile(
+        os.path.join(folder, "pytorch_model.bin")
+    )
+
+
+def write_checkpoint_marker(folder: str, epoch: int, step: int) -> None:
+    """Write a completion marker as the LAST file in checkpoint saving.
+
+    This tiny JSON file acts as an atomicity signal: its presence means all
+    other checkpoint files (model weights, config, training state) were fully
+    written.  It must be called AFTER save_pretrained() and torch.save() have
+    both completed.
+
+    The file is intentionally small (< 100 bytes) so the write is effectively
+    atomic on any POSIX filesystem.
+    """
+    import time as _time
+
+    marker_path = os.path.join(folder, CHECKPOINT_COMPLETE_MARKER)
+    marker_data = {
+        "status": "complete",
+        "epoch": epoch,
+        "global_step": step,
+        "timestamp": _time.time(),
+    }
+    with open(marker_path, "w") as f:
+        json.dump(marker_data, f)
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def is_valid_checkpoint(folder: str) -> bool:
     """
-    Validate that a checkpoint directory contains the required files.
+    Validate that a checkpoint directory is complete and safe to load.
 
-    A valid checkpoint must contain training_state.pt for resume functionality.
-    This prevents selecting a partially-written checkpoint from a preempted job.
+    A checkpoint is considered valid if it has ALL of:
+      1. config.json (model configuration, written by save_pretrained)
+      2. Model weights (model.safetensors OR pytorch_model.bin)
+      3. training_state.pt (optimizer, scheduler, training progress)
+      4. checkpoint_complete.json (completion marker, written LAST)
+
+    For backward compatibility with checkpoints created before the marker was
+    introduced: if config.json + model weights + training_state.pt all exist
+    but the marker is missing, the checkpoint is accepted with a warning.
 
     Args:
         folder: Path to the checkpoint directory
@@ -74,10 +121,30 @@ def is_valid_checkpoint(folder: str) -> bool:
     Returns:
         True if the checkpoint is valid and complete, False otherwise
     """
-    training_state_path = os.path.join(folder, "training_state.pt")
     config_path = os.path.join(folder, "config.json")
-    # Both training_state.pt and config.json are required for a valid checkpoint
-    return os.path.isfile(training_state_path) and os.path.isfile(config_path)
+    training_state_path = os.path.join(folder, "training_state.pt")
+    marker_path = os.path.join(folder, CHECKPOINT_COMPLETE_MARKER)
+
+    has_config = os.path.isfile(config_path)
+    has_weights = _has_model_weights(folder)
+    has_training_state = os.path.isfile(training_state_path)
+    has_marker = os.path.isfile(marker_path)
+
+    # New format: all four files present (strongest guarantee)
+    if has_config and has_weights and has_training_state and has_marker:
+        return True
+
+    # Legacy format: pre-marker checkpoints that have everything except the marker
+    if has_config and has_weights and has_training_state and not has_marker:
+        logger.warning(
+            f"Checkpoint {folder} is missing {CHECKPOINT_COMPLETE_MARKER} "
+            f"(legacy format). Accepting, but cannot guarantee write completed "
+            f"cleanly. Re-save to add the marker."
+        )
+        return True
+
+    # Anything else is incomplete
+    return False
 
 
 def get_last_checkpoint(folder, prefix="epoch"):

@@ -89,13 +89,12 @@ class Eagle3TargetModel(ABC):
                 num_layers - 4,
             ]
         self.aux_hidden_states_layers = aux_hidden_states_layers
-        assert (
-            len(self.aux_hidden_states_layers) == 3
-        ), "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
+        assert len(self.aux_hidden_states_layers) == 3, (
+            "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
+        )
 
 
 class HFEagle3TargetModel(Eagle3TargetModel):
-
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
@@ -132,6 +131,11 @@ class HFEagle3TargetModel(Eagle3TargetModel):
             **device_kwargs,
             **kwargs,
         )
+        # Freeze target model: prevents gradient computation and ensures
+        # dropout layers use inference behavior (no stochastic noise in
+        # the training signal from the teacher).
+        target_model.eval()
+        target_model.requires_grad_(False)
         return cls(target_model)
 
     def _get_transformer_layers(self):
@@ -240,7 +244,6 @@ class HFEagle3TargetModel(Eagle3TargetModel):
 
 
 class SGLangEagle3TargetModel(Eagle3TargetModel):
-
     def __init__(self, model_runner: SGLangRunner):
         super().__init__()
         self.model_runner = model_runner
@@ -502,7 +505,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
 
 class CustomEagle3TargetModel(Eagle3TargetModel):
-
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model

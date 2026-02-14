@@ -29,7 +29,19 @@ from torch.utils.data import DataLoader, DistributedSampler
 class DataCollatorWithPadding:
     """
     Datacollator that will dynamically pad the inputs for batching.
+    Optionally truncates sequences longer than max_length before padding,
+    preventing OOM when preprocessing uses a larger max_length than training.
     """
+
+    def __init__(self, max_length: Optional[int] = None):
+        """
+        Args:
+            max_length: If set, truncate sequences longer than this before padding.
+                       All tensors are truncated at the same position to preserve
+                       alignment. If None, no truncation (original behavior).
+        """
+        self.max_length = max_length
+        self._truncation_warned = False
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         """
@@ -71,11 +83,15 @@ class DataCollatorWithPadding:
         """
         Collate a batch of features.
 
+        If max_length is set, truncates sequences first, then pads to the
+        longest (truncated) sequence in the batch. This prevents OOM when
+        preprocessed data has longer sequences than the training max_length.
+
         Args:
             features: A list of features, where each feature is a dictionary containing:
-                - input_ids: torch.Tensor of shape (n,)
-                - attention_mask: torch.Tensor of shape (n,)
-                - loss_mask: torch.Tensor of shape (n,)
+                - input_ids: torch.Tensor of shape (1, S)
+                - attention_mask: torch.Tensor of shape (1, S)
+                - loss_mask: torch.Tensor of shape (1, S)
 
         Returns:
             A dictionary containing:
@@ -83,6 +99,30 @@ class DataCollatorWithPadding:
                 - attention_mask: torch.Tensor of shape (B, N)
                 - loss_mask: torch.Tensor of shape (B, N)
         """
+        # Truncate sequences exceeding max_length (OOM defense)
+        if self.max_length is not None:
+            for item in features:
+                seq_len = item["input_ids"].shape[1]  # shape is (1, seq_len)
+                if seq_len > self.max_length:
+                    if not self._truncation_warned:
+                        lost = item["loss_mask"][:, self.max_length :].sum().item()
+                        print(
+                            f"[DataCollator] Truncating {seq_len} -> {self.max_length} tokens"
+                            f" (dropped {int(lost)} trainable tokens from this sample)"
+                        )
+                        self._truncation_warned = True
+                    item["input_ids"] = item["input_ids"][:, : self.max_length]
+                    item["attention_mask"] = item["attention_mask"][
+                        :, : self.max_length
+                    ]
+                    item["loss_mask"] = item["loss_mask"][:, : self.max_length]
+                    if "hidden_state" in item:
+                        item["hidden_state"] = item["hidden_state"][
+                            :, : self.max_length, :
+                        ]
+                    if "target" in item:
+                        item["target"] = item["target"][:, : self.max_length, :]
+
         max_length = max(item["input_ids"].shape[1] for item in features)
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
@@ -104,9 +144,9 @@ class DataCollatorWithPadding:
             "target": None,
         }
         if all("hidden_state" in item for item in features):
-            assert all(
-                "target" in item for item in features
-            ), "target is required when hidden_state is provided"
+            assert all("target" in item for item in features), (
+                "target is required when hidden_state is provided"
+            )
             batch["hidden_state"] = torch.cat(
                 [
                     self.paddingtensor(item["hidden_state"], max_length)
@@ -208,9 +248,9 @@ class VlmDataCollatorWithPadding:
             "target": None,
         }
         if all("hidden_state" in item for item in features):
-            assert all(
-                "target" in item for item in features
-            ), "target is required when hidden_state is provided"
+            assert all("target" in item for item in features), (
+                "target is required when hidden_state is provided"
+            )
             batch["hidden_state"] = torch.cat(
                 [
                     self.paddingtensor(item["hidden_state"], max_length)
@@ -238,7 +278,8 @@ def prepare_dp_dataloaders(
     is_vlm: Optional[bool] = False,
     prefetch_factor: Optional[int] = 2,
     seed: Optional[int] = None,
-    **dataloader_kwargs
+    max_length: Optional[int] = None,
+    **dataloader_kwargs,
 ) -> DataLoader:
     """
     Prepare dataloader for distributed data parallel training.
@@ -255,6 +296,8 @@ def prepare_dp_dataloaders(
         seed: Random seed for reproducible shuffling. When resuming training,
             this ensures the data order is deterministic across restarts.
             If None, uses PyTorch's default (non-deterministic) behavior.
+        max_length: If set, truncate sequences longer than this in the collator.
+            Prevents OOM when preprocessing uses a larger max_length than training.
         **dataloader_kwargs: Additional keyword arguments for the DataLoader.
 
     Returns:
@@ -270,9 +313,9 @@ def prepare_dp_dataloaders(
 
     sampler = DistributedSampler(dataset, **sampler_kwargs)
     if is_vlm:
-        datacollator_cls = VlmDataCollatorWithPadding
+        collator = VlmDataCollatorWithPadding()
     else:
-        datacollator_cls = DataCollatorWithPadding
+        collator = DataCollatorWithPadding(max_length=max_length)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -280,8 +323,8 @@ def prepare_dp_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
-        collate_fn=datacollator_cls(),
+        collate_fn=collator,
         drop_last=True,
-        **dataloader_kwargs
+        **dataloader_kwargs,
     )
     return dataloader

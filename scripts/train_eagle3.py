@@ -52,7 +52,34 @@ from specforge.utils import (
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
+    write_checkpoint_marker,
 )
+
+
+# === Fast Intra-Epoch Skip ===
+# Used to skip already-processed batches on resume without DataLoader I/O.
+# Same approach as Accelerate's skip_first_batches().
+
+
+class _SkipBatchSampler:
+    """Wraps a batch sampler to skip the first N batches.
+
+    When resuming mid-epoch, this avoids loading and discarding data for
+    already-processed batches. The DataLoader workers never see the skipped
+    indices, so there is zero I/O cost for the skip.
+    """
+
+    def __init__(self, batch_sampler, skip_batches: int):
+        self.batch_sampler = batch_sampler
+        self.skip_batches = skip_batches
+
+    def __iter__(self):
+        for i, batch in enumerate(self.batch_sampler):
+            if i >= self.skip_batches:
+                yield batch
+
+    def __len__(self):
+        return max(0, len(self.batch_sampler) - self.skip_batches)
 
 
 # === External Schedule Support ===
@@ -74,6 +101,7 @@ class ExternalSchedule:
             - step_range: [5000, null]
               weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
     """
+
     schedule_path: Optional[str] = None
     loss_entries: List[Dict[str, Any]] = field(default_factory=list)
     checksum: str = ""
@@ -81,7 +109,9 @@ class ExternalSchedule:
     default_base: float = DEFAULT_LOSS_DECAY_BASE  # Configurable decay base
 
     @classmethod
-    def from_file(cls, schedule_path: str, default_base: float = DEFAULT_LOSS_DECAY_BASE) -> "ExternalSchedule":
+    def from_file(
+        cls, schedule_path: str, default_base: float = DEFAULT_LOSS_DECAY_BASE
+    ) -> "ExternalSchedule":
         """Load schedule from a YAML file."""
         import yaml
 
@@ -111,7 +141,9 @@ class ExternalSchedule:
         )
 
     @classmethod
-    def default(cls, default_base: float = DEFAULT_LOSS_DECAY_BASE) -> "ExternalSchedule":
+    def default(
+        cls, default_base: float = DEFAULT_LOSS_DECAY_BASE
+    ) -> "ExternalSchedule":
         """Create default schedule (exponential decay base^i)."""
         return cls(
             schedule_path=None,
@@ -124,7 +156,7 @@ class ExternalSchedule:
     def get_loss_weights(self, step: int, num_positions: int) -> List[float]:
         """Get position-based loss weights for a given training step."""
         if not self.loss_entries:
-            return [self.default_base ** i for i in range(num_positions)]
+            return [self.default_base**i for i in range(num_positions)]
 
         # Find applicable entry
         for entry in self.loss_entries:
@@ -243,14 +275,14 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         type=str,
         default=None,
         help="Path to YAML file with external loss position weights schedule. "
-             "If not provided, uses default exponential decay.",
+        "If not provided, uses default exponential decay.",
     )
     training_group.add_argument(
         "--loss-decay-base",
         type=float,
         default=DEFAULT_LOSS_DECAY_BASE,
         help=f"Base for exponential position loss decay (default: {DEFAULT_LOSS_DECAY_BASE}). "
-             "Weight for position i is base^i. Only used when no --loss-schedule-path is provided.",
+        "Weight for position i is base^i. Only used when no --loss-schedule-path is provided.",
     )
     training_group.add_argument("--resume", action="store_true")
     training_group.add_argument(
@@ -475,35 +507,95 @@ def build_draft_model(
     resume_checkpoint_path = None  # Only set when resuming with training state
 
     if args.ckpt_dir is not None:
+        # CRITICAL: Verify the checkpoint directory exists and has required files
+        # This helps catch volume mount issues early
+        if dist.get_rank() == 0:
+            print(f"[CKPT] Verifying --ckpt-dir: {args.ckpt_dir}", flush=True)
+
         if os.path.isdir(args.ckpt_dir):
-            # FIX: load config as object, not string path (was causing .vocab_size crash)
-            draft_model_config = AutoDraftModelConfig.from_file(
-                os.path.join(args.ckpt_dir, "config.json")
+            # Verify essential files exist
+            config_path = os.path.join(args.ckpt_dir, "config.json")
+            model_path_safetensors = os.path.join(args.ckpt_dir, "model.safetensors")
+            model_path_bin = os.path.join(args.ckpt_dir, "pytorch_model.bin")
+
+            if not os.path.isfile(config_path):
+                raise ValueError(
+                    f"--ckpt-dir exists but config.json not found: {config_path}\n"
+                    f"Directory contents: {os.listdir(args.ckpt_dir) if os.path.isdir(args.ckpt_dir) else 'N/A'}"
+                )
+
+            has_weights = os.path.isfile(model_path_safetensors) or os.path.isfile(
+                model_path_bin
             )
+            if not has_weights:
+                raise ValueError(
+                    f"--ckpt-dir exists but no model weights found (model.safetensors or pytorch_model.bin): {args.ckpt_dir}\n"
+                    f"Directory contents: {os.listdir(args.ckpt_dir)}"
+                )
+
+            # FIX: load config as object, not string path (was causing .vocab_size crash)
+            draft_model_config = AutoDraftModelConfig.from_file(config_path)
             draft_model_last_checkpoint = args.ckpt_dir
-            print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
+            print_on_rank0(
+                f"[CKPT] ✓ Verified and loading from: {draft_model_last_checkpoint}"
+            )
+            if dist.get_rank() == 0:
+                print("[CKPT]   config.json: ✓", flush=True)
+                print(
+                    f"[CKPT]   model weights: {'safetensors' if os.path.isfile(model_path_safetensors) else 'bin'}",
+                    flush=True,
+                )
         else:
+            # Enhanced error message with debugging info
+            parent_dir = os.path.dirname(args.ckpt_dir)
+            parent_exists = os.path.isdir(parent_dir)
+            parent_contents = os.listdir(parent_dir) if parent_exists else []
             raise ValueError(
-                f"Provided base model dir {args.ckpt_dir} is not a valid directory."
+                f"Provided base model dir {args.ckpt_dir} is not a valid directory.\n"
+                f"Parent dir exists: {parent_exists}\n"
+                f"Parent dir contents: {parent_contents[:20]}{'...' if len(parent_contents) > 20 else ''}\n"
+                f"This could indicate a volume mount issue. Try reloading volumes before training."
             )
 
     # Detecting last ckpt for draft model when resuming
     # This is the checkpoint that has training state (optimizer, scheduler, global_step)
     if args.resume and os.path.isdir(args.output_dir):
         if dist.get_rank() == 0:
-            print(f"[RESUME] Checking for checkpoints in: {args.output_dir}", flush=True)
+            print(
+                f"[RESUME] Checking for checkpoints in: {args.output_dir}", flush=True
+            )
         found_checkpoint = get_last_checkpoint(args.output_dir)
         if found_checkpoint:
             draft_model_last_checkpoint = found_checkpoint
-            resume_checkpoint_path = found_checkpoint  # Mark this for training state restoration
+            resume_checkpoint_path = (
+                found_checkpoint  # Mark this for training state restoration
+            )
             if dist.get_rank() == 0:
-                print(f"[RESUME] ✓ Checkpoint detected: {resume_checkpoint_path}", flush=True)
+                print(
+                    f"[RESUME] ✓ Checkpoint detected: {resume_checkpoint_path}",
+                    flush=True,
+                )
+                # Warn if --ckpt-dir was also provided (fine-tuning case)
+                # This is expected behavior for preemption resume, but worth logging
+                if args.ckpt_dir is not None:
+                    print(
+                        f"[RESUME] ⚠ Note: --ckpt-dir was provided ({args.ckpt_dir})",
+                        flush=True,
+                    )
+                    print(
+                        "[RESUME]   but loading from output_dir checkpoint instead (preemption resume)",
+                        flush=True,
+                    )
         else:
             if dist.get_rank() == 0:
-                print("[RESUME] ✗ No valid checkpoint found, starting fresh", flush=True)
+                print(
+                    "[RESUME] ✗ No valid checkpoint found, starting fresh", flush=True
+                )
     elif args.resume:
         if dist.get_rank() == 0:
-            print(f"[RESUME] Output dir does not exist yet: {args.output_dir}", flush=True)
+            print(
+                f"[RESUME] Output dir does not exist yet: {args.output_dir}", flush=True
+            )
 
     if draft_model_last_checkpoint:
         draft_model = AutoEagle3DraftModel.from_pretrained(
@@ -530,13 +622,19 @@ def build_dataloaders(
 ) -> Tuple[DataLoader, str, Optional[DataLoader]]:
     """Build train and eval dataloaders.
 
-    Supports two data loading paths:
+    Supports three data loading paths:
     1. FAST PATH: Pre-processed Arrow cache (from preprocess_specforge_data.py)
        - Detects arrow_cache/ and vocab_mapping.pt in train_data_path directory
        - Loads instantly via load_from_disk()
        - No rank_0_priority() needed, all ranks load in parallel
 
-    2. SLOW PATH: Raw JSON files (original behavior)
+    2. PARQUET PATH: Pre-processed parquet shards (from preprocess_specforge_data.py)
+       - Detects shards/*.parquet and vocab_mapping.pt in train_data_path directory
+       - Data is already tokenized (input_ids, loss_mask, attention_mask columns)
+       - Loaded via load_dataset("parquet", ...) with parallel workers
+       - No rank_0_priority() needed, all ranks load in parallel
+
+    3. SLOW PATH: Raw JSON files (original behavior)
        - Loads JSON, tokenizes, builds vocab mapping at training time
        - All done on rank 0 while other ranks wait at barrier
        - Can cause NCCL timeouts for large datasets
@@ -570,48 +668,214 @@ def build_dataloaders(
     c2_arrow = train_data_dir
     c2_vocab = os.path.join(os.path.dirname(train_data_dir), "vocab_mapping.pt")
 
+    def _is_valid_arrow_cache(arrow_dir: str) -> bool:
+        """Check if arrow_cache directory is a complete HuggingFace save_to_disk() output.
+
+        dataset_info.json is written LAST by save_to_disk(), so its presence
+        guarantees all arrow shards and state.json are fully written. This
+        protects against loading a partially-written cache from interrupted
+        preprocessing.
+        """
+        return os.path.isdir(arrow_dir) and os.path.isfile(
+            os.path.join(arrow_dir, "dataset_info.json")
+        )
+
     is_fast_path = False
-    if os.path.isdir(c1_arrow) and os.path.isfile(c1_vocab):
+    fast_path_rejection_reason = None  # Diagnostic for why fast path was skipped
+
+    if _is_valid_arrow_cache(c1_arrow) and os.path.isfile(c1_vocab):
         arrow_cache_dir = c1_arrow
         vocab_mapping_path_candidate = c1_vocab
         is_fast_path = True
-    elif os.path.basename(c2_arrow) == "arrow_cache" and os.path.isdir(c2_arrow) and os.path.isfile(c2_vocab):
+    elif (
+        os.path.basename(c2_arrow) == "arrow_cache"
+        and _is_valid_arrow_cache(c2_arrow)
+        and os.path.isfile(c2_vocab)
+    ):
         arrow_cache_dir = c2_arrow
         vocab_mapping_path_candidate = c2_vocab
         is_fast_path = True
+    else:
+        # Detect WHY fast path was rejected for clear error messages
+        for label, arrow, vocab in [
+            ("candidate1", c1_arrow, c1_vocab),
+            ("candidate2", c2_arrow, c2_vocab),
+        ]:
+            if os.path.isdir(arrow) and not os.path.isfile(
+                os.path.join(arrow, "dataset_info.json")
+            ):
+                fast_path_rejection_reason = (
+                    f"Arrow cache directory exists at {arrow} but appears incomplete "
+                    f"(missing dataset_info.json). This usually means preprocessing was "
+                    f"interrupted. Re-run preprocess_specforge_data.py to fix."
+                )
+                break
+            if (
+                os.path.isdir(arrow)
+                and os.path.isfile(os.path.join(arrow, "dataset_info.json"))
+                and not os.path.isfile(vocab)
+            ):
+                fast_path_rejection_reason = (
+                    f"Arrow cache is complete at {arrow} but vocab_mapping.pt is "
+                    f"missing at {vocab}. Re-run preprocess_specforge_data.py to fix."
+                )
+                break
+
+    # Check for parquet shards (PARQUET PATH)
+    # Expected structure: /path/to/data/shards/*.parquet and /path/to/data/vocab_mapping.pt
+    is_parquet_path = False
+    parquet_shards_dir = None
+    parquet_vocab_path_candidate = None
+
+    if not is_fast_path:
+        # Candidate: train_data_dir/shards/ (standard preprocess output)
+        c1_shards = os.path.join(train_data_dir, "shards")
+        if os.path.isdir(c1_shards) and os.path.isfile(c1_vocab):
+            parquet_shards_dir = c1_shards
+            parquet_vocab_path_candidate = c1_vocab
+            is_parquet_path = True
 
     if is_fast_path:
         # FAST PATH: Load pre-processed Arrow cache
-        print_on_rank0(f"[FAST PATH] Loading pre-processed Arrow cache from {arrow_cache_dir}")
-        print_on_rank0(f"[FAST PATH] Using pre-computed vocab mapping from {vocab_mapping_path_candidate}")
+        print_on_rank0(
+            f"[FAST PATH] Loading pre-processed Arrow cache from {arrow_cache_dir}"
+        )
+        print_on_rank0(
+            f"[FAST PATH] Using pre-computed vocab mapping from {vocab_mapping_path_candidate}"
+        )
 
         # Validate vocab sizes match (if metadata exists)
-        metadata_path = os.path.join(os.path.dirname(arrow_cache_dir), "dataset_metadata.json")
+        metadata_path = os.path.join(
+            os.path.dirname(arrow_cache_dir), "dataset_metadata.json"
+        )
         if os.path.exists(metadata_path):
             import json
+
             with open(metadata_path) as f:
                 metadata = json.load(f)
             expected_draft_vocab = metadata.get("draft_vocab_size")
             expected_target_vocab = metadata.get("target_vocab_size")
-            if expected_draft_vocab and expected_draft_vocab != draft_model_config.draft_vocab_size:
+            if (
+                expected_draft_vocab
+                and expected_draft_vocab != draft_model_config.draft_vocab_size
+            ):
                 raise ValueError(
                     f"[FAST PATH] Vocab size mismatch! Preprocessed with draft_vocab_size={expected_draft_vocab}, "
                     f"but draft_model_config expects {draft_model_config.draft_vocab_size}. "
                     f"Re-run preprocessing with correct vocab sizes."
                 )
-            if expected_target_vocab and expected_target_vocab != draft_model_config.vocab_size:
+            if (
+                expected_target_vocab
+                and expected_target_vocab != draft_model_config.vocab_size
+            ):
                 raise ValueError(
                     f"[FAST PATH] Vocab size mismatch! Preprocessed with target_vocab_size={expected_target_vocab}, "
                     f"but draft_model_config expects {draft_model_config.vocab_size}. "
                     f"Re-run preprocessing with correct vocab sizes."
                 )
-            print_on_rank0(f"[FAST PATH] Vocab sizes validated: draft={expected_draft_vocab}, target={expected_target_vocab}")
+            print_on_rank0(
+                f"[FAST PATH] Vocab sizes validated: draft={expected_draft_vocab}, target={expected_target_vocab}"
+            )
 
         train_eagle3_dataset = load_from_disk(arrow_cache_dir)
         train_eagle3_dataset.set_format(type="torch")
         vocab_mapping_path = vocab_mapping_path_candidate
 
-        print_on_rank0(f"[FAST PATH] Loaded {len(train_eagle3_dataset):,} samples instantly!")
+        print_on_rank0(
+            f"[FAST PATH] Loaded {len(train_eagle3_dataset):,} samples instantly!"
+        )
+
+        # Handle offline training (hidden states) if specified
+        if args.train_hidden_states_path is not None:
+            train_eagle3_dataset = build_offline_eagle3_dataset(
+                args.train_hidden_states_path,
+                args.max_length,
+            )
+    elif is_parquet_path:
+        # PARQUET PATH: Load pre-processed parquet shards (fast, no rank_0_priority needed)
+        import glob
+        import json
+
+        import pyarrow.parquet as pq
+
+        print_on_rank0(
+            f"[PARQUET PATH] Loading pre-processed parquet shards from {parquet_shards_dir}"
+        )
+        print_on_rank0(
+            f"[PARQUET PATH] Using pre-computed vocab mapping from {parquet_vocab_path_candidate}"
+        )
+
+        # Validate vocab sizes match (if metadata exists)
+        metadata_path = os.path.join(train_data_dir, "dataset_metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            expected_draft_vocab = metadata.get("draft_vocab_size")
+            expected_target_vocab = metadata.get("target_vocab_size")
+            if (
+                expected_draft_vocab
+                and expected_draft_vocab != draft_model_config.draft_vocab_size
+            ):
+                raise ValueError(
+                    f"[PARQUET PATH] Vocab size mismatch! Preprocessed with draft_vocab_size={expected_draft_vocab}, "
+                    f"but draft_model_config expects {draft_model_config.draft_vocab_size}. "
+                    f"Re-run preprocessing with correct vocab sizes."
+                )
+            if (
+                expected_target_vocab
+                and expected_target_vocab != draft_model_config.vocab_size
+            ):
+                raise ValueError(
+                    f"[PARQUET PATH] Vocab size mismatch! Preprocessed with target_vocab_size={expected_target_vocab}, "
+                    f"but draft_model_config expects {draft_model_config.vocab_size}. "
+                    f"Re-run preprocessing with correct vocab sizes."
+                )
+            print_on_rank0(
+                f"[PARQUET PATH] Vocab sizes validated: draft={expected_draft_vocab}, target={expected_target_vocab}"
+            )
+
+        # Find and validate parquet files
+        parquet_pattern = os.path.join(parquet_shards_dir, "*.parquet")
+        parquet_files = sorted(glob.glob(parquet_pattern))
+
+        # Filter out empty and corrupted parquet files
+        valid_files = []
+        for f in parquet_files:
+            if os.path.getsize(f) == 0:
+                continue
+            try:
+                pq.read_metadata(f)
+                valid_files.append(f)
+            except Exception:
+                print_on_rank0(
+                    f"[PARQUET PATH] Skipping corrupted parquet: {os.path.basename(f)}"
+                )
+        skipped = len(parquet_files) - len(valid_files)
+        if skipped:
+            print_on_rank0(
+                f"[PARQUET PATH] Skipped {skipped} corrupted/empty parquet files"
+            )
+        parquet_files = valid_files
+
+        if not parquet_files:
+            raise ValueError(
+                f"[PARQUET PATH] No valid parquet files found in {parquet_shards_dir}"
+            )
+
+        print_on_rank0(
+            f"[PARQUET PATH] Loading {len(parquet_files)} parquet shards..."
+        )
+        train_eagle3_dataset = load_dataset(
+            "parquet",
+            data_files={"train": parquet_files},
+            num_proc=args.build_dataset_num_proc,
+        )["train"]
+        train_eagle3_dataset.set_format(type="torch")
+        vocab_mapping_path = parquet_vocab_path_candidate
+
+        print_on_rank0(
+            f"[PARQUET PATH] Loaded {len(train_eagle3_dataset):,} samples from parquet shards!"
+        )
 
         # Handle offline training (hidden states) if specified
         if args.train_hidden_states_path is not None:
@@ -621,8 +885,14 @@ def build_dataloaders(
             )
     else:
         # SLOW PATH: Process from JSON files (original behavior)
-        print_on_rank0("[SLOW PATH] No Arrow cache found, processing from JSON files")
-        print_on_rank0("[SLOW PATH] To speed this up, run preprocess_specforge_data.py first")
+        if fast_path_rejection_reason:
+            print_on_rank0(f"[FAST PATH] Rejected: {fast_path_rejection_reason}")
+        print_on_rank0(
+            "[SLOW PATH] No valid Arrow cache or parquet shards found, processing from JSON files"
+        )
+        print_on_rank0(
+            "[SLOW PATH] To speed this up, run preprocess_specforge_data.py first"
+        )
 
         cache_params_string = (
             f"{args.train_data_path}-"
@@ -668,6 +938,7 @@ def build_dataloaders(
         process_group=get_dp_group(),
         is_vlm=args.is_vlm,
         seed=args.seed,  # Ensure reproducible shuffling across restarts
+        max_length=args.max_length,  # Truncate at collation time (OOM defense)
     )
 
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
@@ -696,6 +967,7 @@ def build_dataloaders(
             process_group=get_dp_group(),
             is_vlm=args.is_vlm,
             seed=args.seed,  # Consistent seeding with train dataloader
+            max_length=args.max_length,  # Truncate at collation time (OOM defense)
         )
         print_with_rank("Initialized eval dataloader")
     else:
@@ -740,18 +1012,26 @@ def save_checkpoints(
         }
 
         if dist.get_rank() == 0:
+            # Write order matters for crash safety:
+            #   1. save_pretrained() — model weights + config.json (largest, most expensive)
+            #   2. training_state.pt — optimizer, scheduler, training progress
+            #   3. checkpoint_complete.json — tiny marker written LAST
+            # If preemption interrupts at any point, the missing marker causes
+            # is_valid_checkpoint() to reject the incomplete checkpoint.
+            eagle3_model.draft_model.save_pretrained(
+                epoch_output_dir,
+                state_dict=draft_model_state_dict,
+            )
+            print_on_rank0(f"Saved model weights + config to {epoch_output_dir}")
             torch.save(
                 state_to_save,
                 os.path.join(epoch_output_dir, "training_state.pt"),
             )
             print_on_rank0(
-                f"Saved full training state to {epoch_output_dir}/training_state.pt"
+                f"Saved training state to {epoch_output_dir}/training_state.pt"
             )
-            eagle3_model.draft_model.save_pretrained(
-                epoch_output_dir,
-                state_dict=draft_model_state_dict,
-            )
-            print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
+            write_checkpoint_marker(epoch_output_dir, epoch, step)
+            print_on_rank0(f"Wrote checkpoint completion marker to {epoch_output_dir}")
         dist.barrier()
 
 
@@ -810,8 +1090,11 @@ def run_backward_and_update(
     plosses: List[torch.Tensor],
     optimizer: Optimizer,
     global_step: int,
-    loss_schedule: Optional["ExternalSchedule"] = None,  # NEW: External schedule for loss weights
-) -> None:
+    accumulation_counter: int,
+    loss_schedule: Optional[
+        "ExternalSchedule"
+    ] = None,  # NEW: External schedule for loss weights
+) -> Tuple[bool, int]:
     """Apply position-weighted loss and update optimizer.
 
     Args:
@@ -819,15 +1102,23 @@ def run_backward_and_update(
         plosses: Per-position losses from the model
         optimizer: The optimizer
         global_step: Current global training step
+        accumulation_counter: Number of backward passes accumulated so far in the
+            current window (0-indexed before this call). Reset to 0 after optimizer step.
         loss_schedule: External schedule for dynamic loss weights.
                       Should always be provided (use ExternalSchedule.default() if none specified).
+
+    Returns:
+        Tuple of (step_ok, updated_accumulation_counter):
+        - step_ok: True if optimizer step was applied (or not yet at accumulation boundary),
+          False if step was skipped due to NaN/Inf gradients.
+        - updated_accumulation_counter: 0 if optimizer stepped, incremented otherwise.
     """
     # Get loss weights from schedule (or use default constant)
     if loss_schedule is not None:
         ploss_weight = loss_schedule.get_loss_weights(global_step, len(plosses))
     else:
         # Fallback: use default constant (shouldn't happen if caller uses ExternalSchedule.default())
-        ploss_weight = [DEFAULT_LOSS_DECAY_BASE ** i for i in range(len(plosses))]
+        ploss_weight = [DEFAULT_LOSS_DECAY_BASE**i for i in range(len(plosses))]
 
     ploss = (
         sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
@@ -835,8 +1126,11 @@ def run_backward_and_update(
     )
     ploss.backward()
 
-    if global_step % args.draft_accumulation_steps == 0:
-        optimizer.step()
+    accumulation_counter += 1
+    if accumulation_counter >= args.draft_accumulation_steps:
+        step_ok = optimizer.step()
+        return step_ok, 0
+    return True, accumulation_counter
 
 
 def record_metrcs(
@@ -915,13 +1209,19 @@ def main():
     # 1.5 Load External Schedule (if provided)
     # ================================================
     if args.loss_schedule_path:
-        loss_schedule = ExternalSchedule.from_file(args.loss_schedule_path, default_base=args.loss_decay_base)
-        print_on_rank0(f"[SCHEDULE] Loaded loss schedule from {args.loss_schedule_path}")
+        loss_schedule = ExternalSchedule.from_file(
+            args.loss_schedule_path, default_base=args.loss_decay_base
+        )
+        print_on_rank0(
+            f"[SCHEDULE] Loaded loss schedule from {args.loss_schedule_path}"
+        )
         print_on_rank0(f"[SCHEDULE] Description: {loss_schedule.description}")
         print_on_rank0(f"[SCHEDULE] Checksum: {loss_schedule.checksum}")
     else:
         loss_schedule = ExternalSchedule.default(default_base=args.loss_decay_base)
-        print_on_rank0(f"[SCHEDULE] Using default exponential decay ({args.loss_decay_base}^i)")
+        print_on_rank0(
+            f"[SCHEDULE] Using default exponential decay ({args.loss_decay_base}^i)"
+        )
 
     # ================================================
     # 2. Build models
@@ -1018,13 +1318,18 @@ def main():
     # Initialize defaults - will be overwritten if resuming
     global_step = 0
     start_epoch = 0
-    step_in_epoch_resume = 0  # NEW: For intra-epoch resume (skip already-processed batches)
+    step_in_epoch_resume = (
+        0  # NEW: For intra-epoch resume (skip already-processed batches)
+    )
 
     if resume_checkpoint_path is not None:
         training_state_path = os.path.join(resume_checkpoint_path, "training_state.pt")
         if os.path.isfile(training_state_path):
             if dist.get_rank() == 0:
-                print(f"[RESUME] Loading training state from: {training_state_path}", flush=True)
+                print(
+                    f"[RESUME] Loading training state from: {training_state_path}",
+                    flush=True,
+                )
             # Load on CPU first to avoid GPU memory fragmentation
             # weights_only=False required because training_state contains argparse.Namespace
             # This is safe since we're loading our own checkpoint files
@@ -1049,6 +1354,22 @@ def main():
                     f"step_in_epoch={step_in_epoch_resume}, lr={optimizer.get_learning_rate():.2e}",
                     flush=True,
                 )
+
+                # Validate loss schedule checksum matches checkpoint
+                saved_schedule = training_state.get("loss_schedule", {})
+                saved_checksum = saved_schedule.get("schedule_checksum", "")
+                if saved_checksum and saved_checksum != loss_schedule.checksum:
+                    print(
+                        f"[RESUME] WARNING: Loss schedule changed since checkpoint! "
+                        f"Checkpoint checksum={saved_checksum}, current={loss_schedule.checksum}. "
+                        f"Position weights may differ from original run.",
+                        flush=True,
+                    )
+                elif saved_checksum:
+                    print(
+                        f"[RESUME] ✓ Loss schedule checksum matches: {saved_checksum}",
+                        flush=True,
+                    )
         else:
             if dist.get_rank() == 0:
                 print(
@@ -1074,40 +1395,65 @@ def main():
             flush=True,
         )
 
+    # Explicit accumulation counter — tracks how many backward passes have
+    # accumulated since the last optimizer.step().  Unlike the previous
+    # `global_step % draft_accumulation_steps == 0` check, this counter is
+    # reset at epoch boundaries (along with the gradients) so that gradients
+    # never mix data from two different epoch shuffles.
+    accumulation_counter = 0
+
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
-        train_dataloader.sampler.set_epoch(epoch + 1)
+        # set_epoch(epoch) ensures DistributedSampler produces the same permutation
+        # for a given epoch across fresh runs and resumes (deterministic with seed).
+        # Using epoch (not epoch+1) so the permutation matches what was used in the
+        # original run when resuming mid-epoch with step_in_epoch_resume.
+        train_dataloader.sampler.set_epoch(epoch)
         draft_model.train()
 
-        # Log skip info if resuming mid-epoch
-        if epoch == start_epoch and step_in_epoch_resume > 0:
+        # Fast intra-epoch skip: modify batch_sampler so DataLoader workers
+        # never load data for already-processed batches.  This is orders of
+        # magnitude faster than iterating with `continue` (which still does
+        # I/O for every skipped batch).  Same approach as Accelerate's
+        # skip_first_batches().
+        skip_batches = step_in_epoch_resume if epoch == start_epoch else 0
+        orig_batch_sampler = None
+        if skip_batches > 0:
             if dist.get_rank() == 0:
                 print(
-                    f"[RESUME] Skipping {step_in_epoch_resume} batches in epoch {epoch} "
+                    f"[RESUME] Fast-skipping {skip_batches} batches in epoch {epoch} "
                     f"(already processed before checkpoint)",
                     flush=True,
                 )
+            orig_batch_sampler = train_dataloader.batch_sampler
+            # Temporarily disable PyTorch's DataLoader init guard so we can
+            # swap the batch_sampler.  Same technique as Accelerate's
+            # skip_first_batches().
+            train_dataloader._DataLoader__initialized = False
+            train_dataloader.batch_sampler = _SkipBatchSampler(
+                orig_batch_sampler, skip_batches
+            )
+            train_dataloader._DataLoader__initialized = True
 
+        total_batches_in_epoch = len(train_dataloader) + skip_batches
         if dist.get_rank() == 0:
             progress_bar = tqdm(
-                enumerate(train_dataloader),
+                enumerate(train_dataloader, start=skip_batches),
                 desc=f"Training Epoch {epoch}",
                 leave=True,
-                total=len(train_dataloader),
+                initial=skip_batches,
+                total=total_batches_in_epoch,
             )
         else:
-            progress_bar = enumerate(train_dataloader)
+            progress_bar = enumerate(train_dataloader, start=skip_batches)
 
         # Track current position in epoch for checkpointing
-        current_step_in_epoch = 0
+        current_step_in_epoch = skip_batches
 
         for batch_idx, data in progress_bar:
-            # INTRA-EPOCH RESUME: Skip already-processed batches
-            # This is safe because DistributedSampler is deterministic with same seed + epoch
-            if epoch == start_epoch and batch_idx < step_in_epoch_resume:
-                continue
-
-            current_step_in_epoch = batch_idx + 1  # Track position (1-indexed for next resume)
+            current_step_in_epoch = (
+                batch_idx + 1
+            )  # Track position (1-indexed for next resume)
             global_step += 1
 
             # ================================================
@@ -1144,15 +1490,33 @@ def main():
             plosses, acces = run_forward(
                 args, eagle3_model, data, target_model, is_online
             )
-            run_backward_and_update(args, plosses, optimizer, global_step, loss_schedule)
+            step_applied, accumulation_counter = run_backward_and_update(
+                args,
+                plosses,
+                optimizer,
+                global_step,
+                accumulation_counter,
+                loss_schedule,
+            )
 
             # log training metrics
             if global_step % args.log_interval == 0:
                 record_metrcs(
-                    args, acces, plosses, global_step, tracker, optimizer, mode="train",
+                    args,
+                    acces,
+                    plosses,
+                    global_step,
+                    tracker,
+                    optimizer,
+                    mode="train",
                     source_ids=batch_source_ids,
                     source_registry=source_registry,
                 )
+                # Track NaN skip rate for observability (visible in W&B/TensorBoard)
+                if not step_applied:
+                    tracker.log({"train/nan_skip": 1}, step=global_step)
+                else:
+                    tracker.log({"train/nan_skip": 0}, step=global_step)
 
             if dist.get_rank() == 0:
                 time_per_step = time.time() - last_time
@@ -1203,7 +1567,9 @@ def main():
                 eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
 
                 # Concatenate all eval source_ids for distribution logging
-                all_eval_source_ids = torch.cat(eval_source_ids) if eval_source_ids else None
+                all_eval_source_ids = (
+                    torch.cat(eval_source_ids) if eval_source_ids else None
+                )
 
                 record_metrcs(
                     args,
@@ -1222,7 +1588,11 @@ def main():
             if global_step % args.save_interval == 0:
                 # Save the model with intra-epoch position and schedule state for proper resume
                 save_checkpoints(
-                    args, epoch, global_step, eagle3_model, optimizer,
+                    args,
+                    epoch,
+                    global_step,
+                    eagle3_model,
+                    optimizer,
                     step_in_epoch=current_step_in_epoch,
                     loss_schedule=loss_schedule,
                 )
@@ -1230,11 +1600,40 @@ def main():
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
 
+        # --- Epoch boundary: restore original batch_sampler if it was modified ---
+        if orig_batch_sampler is not None:
+            train_dataloader._DataLoader__initialized = False
+            train_dataloader.batch_sampler = orig_batch_sampler
+            train_dataloader._DataLoader__initialized = True
+            orig_batch_sampler = None
+
+        # --- Epoch boundary: discard partial gradient accumulation ---
+        # If the epoch ended mid-accumulation window, the accumulated gradients
+        # are from THIS epoch's shuffle. The next epoch will call set_epoch()
+        # which changes the data permutation. Carrying these gradients over
+        # would mix two epochs' data in a single optimizer step.
+        # We zero them instead. At most (draft_accumulation_steps - 1) batches
+        # of gradient work are discarded per epoch — negligible for typical
+        # dataset sizes (same trade-off as drop_last=True).
+        if accumulation_counter > 0:
+            if dist.get_rank() == 0:
+                print(
+                    f"[EPOCH {epoch}] Discarding {accumulation_counter} partially "
+                    f"accumulated gradient steps at epoch boundary "
+                    f"(draft_accumulation_steps={args.draft_accumulation_steps})",
+                    flush=True,
+                )
+            optimizer.zero_grad()
+            accumulation_counter = 0
+
         # Reset intra-epoch skip after first resumed epoch completes
         # (subsequent epochs start from batch 0)
         if epoch == start_epoch and step_in_epoch_resume > 0:
             if dist.get_rank() == 0:
-                print(f"[RESUME] Epoch {epoch} complete, skip disabled for subsequent epochs", flush=True)
+                print(
+                    f"[RESUME] Epoch {epoch} complete, skip disabled for subsequent epochs",
+                    flush=True,
+                )
             step_in_epoch_resume = 0
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:

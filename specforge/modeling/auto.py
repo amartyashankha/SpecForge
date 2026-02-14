@@ -64,18 +64,43 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         *model_args,
         **kwargs,
     ):
+        """Load a pretrained EAGLE3 draft model.
+        
+        This method directly uses _model_mapping instead of relying on HuggingFace's
+        auto class registry (which doesn't know about LlamaForCausalLMEagle3).
+        """
+        # Load config to determine model class
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+        
+        # Force tie_word_embeddings to False (embedding is loaded separately)
+        if hasattr(config, "tie_word_embeddings"):
+            config.tie_word_embeddings = False
+        
+        # Get model class from our mapping (not HuggingFace's registry)
+        config_type = type(config)
+        if config_type not in cls._model_mapping:
+            raise ValueError(
+                f"Unsupported config type: {config_type}. "
+                f"Supported types: {list(cls._model_mapping.keys())}"
+            )
+        model_cls = cls._model_mapping[config_type]
+        
+        # Filter warnings about embed_tokens.weight being initialized
+        # (expected because we load embeddings separately via load_embedding)
         original_warn = modeling_utils.logger.warning
-
         def filtered_warning(msg):
             if "embed_tokens.weight" in str(msg) and "initialized" in str(msg):
                 return
             original_warn(msg)
-
         modeling_utils.logger.warning = filtered_warning
 
         try:
-            model = super().from_pretrained(
-                pretrained_model_name_or_path, *model_args, **kwargs
+            # Load model using the specific class (not AutoModelForCausalLM)
+            model = model_cls.from_pretrained(
+                pretrained_model_name_or_path,
+                config=config,
+                *model_args,
+                **kwargs
             )
         finally:
             modeling_utils.logger.warning = original_warn
