@@ -140,3 +140,12 @@ effects.
 `run_dflash_chat_serving_gate.py` remain dependency-light leaf helpers for
 targeted debugging. The chat checker itself does not manage services; the two
 shell orchestrators above own service launch, health checks, and cleanup.
+
+`check_overfit_metrics.py` consumes the unified trainer's real `acc` key while
+retaining explicit compatibility with historical `accuracy` logs. It rejects
+non-finite metrics and requires the newest checkpoint step to equal the final
+logged step. A resume gate should pass `--expected-first-step <N>` against its
+phase-B-only log so replay from step one fails explicitly. An EAGLE3 gate should
+also pass `--expected-position-count <N>` so
+the checker requires exactly `acc_0` through `acc_<N-1>` and applies the same
+accuracy threshold to every position.

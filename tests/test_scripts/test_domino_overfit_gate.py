@@ -256,8 +256,8 @@ class TestDominoOverfitGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "train.log"
             log.write_text(
-                "step 2: {'loss': 0.2, 'accuracy': 0.8}\n"
-                "step 10: {'loss': 0.0, 'accuracy': 1.0}\n",
+                "step 2: {'loss': 0.2, 'acc': 0.8}\n"
+                "step 10: {'loss': 0.0, 'acc': 1.0}\n",
                 encoding="utf-8",
             )
             checkpoint_root = Path(tmp) / "checkpoints"
@@ -270,15 +270,124 @@ class TestDominoOverfitGate(unittest.TestCase):
                 str(log),
                 str(checkpoint_root),
                 expected_step=10,
+                expected_first_step=2,
                 max_loss=1e-4,
                 min_accuracy=1.0,
             )
 
             self.assertTrue(result["passed"])
+            self.assertEqual(result["first_step"], 2)
+            self.assertEqual(result["accuracy_key"], "acc")
             self.assertEqual(
                 result["checkpoint"],
                 str(checkpoint_root / "run-step10" / "training_state.pt"),
             )
+
+            with self.assertRaisesRegex(
+                ValueError, "first logged step 2 != expected 3"
+            ):
+                check_overfit.check_overfit(
+                    str(log),
+                    str(checkpoint_root),
+                    expected_step=10,
+                    expected_first_step=3,
+                    max_loss=1e-4,
+                    min_accuracy=1.0,
+                )
+
+    def test_eagle3_requires_every_position_and_exact_checkpoint_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "train.log"
+            log.write_text(
+                "step 10: {'loss': 0.0, 'acc': 1.0, "
+                "'acc_0': 1.0, 'acc_1': 1.0, 'acc_2': 1.0}\n",
+                encoding="utf-8",
+            )
+            checkpoint_root = Path(tmp) / "checkpoints"
+            checkpoint = checkpoint_root / "run-step10"
+            checkpoint.mkdir(parents=True)
+            (checkpoint / "training_state.pt").touch()
+
+            result = check_overfit.check_overfit(
+                str(log),
+                str(checkpoint_root),
+                expected_step=10,
+                max_loss=1e-4,
+                min_accuracy=1.0,
+                require_position_accuracy=True,
+                expected_position_count=3,
+            )
+
+            self.assertEqual(
+                result["position_accuracies"],
+                {"acc_0": 1.0, "acc_1": 1.0, "acc_2": 1.0},
+            )
+            self.assertEqual(result["checkpoint_step"], 10)
+
+    def test_eagle3_rejects_missing_or_imperfect_position_accuracy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_root = Path(tmp) / "checkpoints"
+            checkpoint = checkpoint_root / "run-step10"
+            checkpoint.mkdir(parents=True)
+            (checkpoint / "training_state.pt").touch()
+
+            missing = Path(tmp) / "missing.log"
+            missing.write_text(
+                "step 10: {'loss': 0.0, 'acc': 1.0}\n", encoding="utf-8"
+            )
+            with self.assertRaises(ValueError) as raised:
+                check_overfit.check_overfit(
+                    str(missing),
+                    str(checkpoint_root),
+                    expected_step=10,
+                    max_loss=1e-4,
+                    min_accuracy=1.0,
+                    require_position_accuracy=True,
+                    expected_position_count=3,
+                )
+            self.assertIn("no per-position", str(raised.exception))
+
+            imperfect = Path(tmp) / "imperfect.log"
+            imperfect.write_text(
+                "step 10: {'loss': 0.0, 'acc': 1.0, 'acc_0': 1.0, "
+                "'acc_1': 0.99}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as raised:
+                check_overfit.check_overfit(
+                    str(imperfect),
+                    str(checkpoint_root),
+                    expected_step=10,
+                    max_loss=1e-4,
+                    min_accuracy=1.0,
+                    require_position_accuracy=True,
+                    expected_position_count=3,
+                )
+            self.assertIn("final acc_1 0.99 < 1.0", str(raised.exception))
+
+    def test_rejects_nonfinite_metrics_and_wrong_checkpoint_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "train.log"
+            log.write_text(
+                "step 10: {'loss': 1e999, 'acc': 1.0}\n",
+                encoding="utf-8",
+            )
+            checkpoint_root = Path(tmp) / "checkpoints"
+            checkpoint = checkpoint_root / "run-step9"
+            checkpoint.mkdir(parents=True)
+            (checkpoint / "training_state.pt").touch()
+
+            with self.assertRaises(ValueError) as raised:
+                check_overfit.check_overfit(
+                    str(log),
+                    str(checkpoint_root),
+                    expected_step=10,
+                    max_loss=1e-4,
+                    min_accuracy=1.0,
+                )
+            message = str(raised.exception)
+            self.assertIn("loss is not finite", message)
+            self.assertIn("checkpoint step 9 != expected 10", message)
 
     def test_fails_when_any_gate_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
